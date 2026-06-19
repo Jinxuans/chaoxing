@@ -11,9 +11,7 @@ from pathlib import Path
 from re import sub
 from typing import Optional
 
-import httpx
 import requests
-from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
 from api.answer_check import check_answer
@@ -1001,6 +999,45 @@ class AI(Tiku):
                 logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
                 time.sleep(sleep_time)
 
+    def _chat_completion(self, messages: list, max_tokens: int = 4096) -> str:
+        api_url = self.endpoint.rstrip('/')
+        if not api_url.endswith('/chat/completions'):
+            api_url = f'{api_url}/chat/completions'
+
+        payload = self._completion_kwargs(
+            model=self.model,
+            messages=messages,
+            max_tokens=max_tokens
+        )
+        extra_body = payload.pop('extra_body', None)
+        if extra_body:
+            payload.update(extra_body)
+
+        headers = {
+            'Authorization': f'Bearer {self.key}',
+            'Content-Type': 'application/json'
+        }
+        proxies = None
+        if self.http_proxy:
+            proxies = {
+                'http': self.http_proxy,
+                'https': self.http_proxy
+            }
+
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            proxies=proxies,
+            timeout=60
+        )
+        self.last_request_time = time.time()
+        if response.status_code != 200:
+            raise RuntimeError(f'HTTP {response.status_code}: {response.text[:500]}')
+
+        result = response.json()
+        return result['choices'][0]['message'].get('content') or ''
+
     def _query(self, q_info: dict):
         def remove_md_json_wrapper(md_str):
             # 使用正则表达式匹配Markdown代码块并提取内容
@@ -1008,22 +1045,14 @@ class AI(Tiku):
             match = re.search(pattern, md_str, re.DOTALL)
             return match.group(1).strip() if match else md_str.strip()
 
-        if self.http_proxy:
-            proxy = self.http_proxy
-            httpx_client = httpx.Client(proxy=proxy)
-            client = OpenAI(http_client=httpx_client, base_url = self.endpoint,api_key = self.key)
-        else:
-            client = OpenAI(base_url = self.endpoint,api_key = self.key)
         # 去除选项字母，防止大模型直接输出字母而非内容
         options_list = q_info['options'].split('\n')
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
         options = "\n".join(cleaned_options)
         # 判断题目类型
         self._wait_for_interval()
-        self.last_request_time = time.time()
         if q_info['type'] == "single":
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model = self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         "role": "system",
@@ -1034,10 +1063,9 @@ class AI(Tiku):
                         "content": f"题目：{q_info['title']}\n选项：{options}"
                     }
                 ]
-            ))
+            )
         elif q_info['type'] == 'multiple':
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model = self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         "role": "system",
@@ -1048,10 +1076,9 @@ class AI(Tiku):
                         "content": f"题目：{q_info['title']}\n选项：{options}"
                     }
                 ]
-            ))
+            )
         elif q_info['type'] == 'completion':
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model = self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         "role": "system",
@@ -1062,10 +1089,9 @@ class AI(Tiku):
                         "content": f"题目：{q_info['title']}"
                     }
                 ]
-            ))
+            )
         elif q_info['type'] == 'judgement':
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model = self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         "role": "system",
@@ -1076,10 +1102,9 @@ class AI(Tiku):
                         "content": f"题目：{q_info['title']}"
                     }
                 ]
-            ))
+            )
         else:
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model = self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         "role": "system",
@@ -1090,10 +1115,10 @@ class AI(Tiku):
                         "content": f"题目：{q_info['title']}"
                     }
                 ]
-            ))
+            )
 
         try:
-            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            response = json.loads(remove_md_json_wrapper(content))
             sep = "\n"
             return sep.join(response['Answer']).strip()
         except:
@@ -1114,17 +1139,9 @@ class AI(Tiku):
         """
         logger.info(f'正在检查 {self.name} 连接...')
         try:
-            if self.http_proxy:
-                httpx_client = httpx.Client(proxy=self.http_proxy)
-                client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
-            else:
-                client = OpenAI(base_url=self.endpoint, api_key=self.key)
-
             # 发送一个简单的测试请求
             self._wait_for_interval()
-            self.last_request_time = time.time()
-            completion = client.chat.completions.create(**self._completion_kwargs(
-                model=self.model,
+            content = self._chat_completion(
                 messages=[
                     {
                         'role': 'user',
@@ -1132,9 +1149,9 @@ class AI(Tiku):
                     }
                 ],
                 max_tokens=64
-            ))
+            )
             
-            if completion.choices and completion.choices[0].message.content:
+            if content:
                 logger.info(f'{self.name} 连接检查成功')
                 return True
             else:
