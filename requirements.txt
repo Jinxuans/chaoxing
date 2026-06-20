@@ -12,3 +12,5 @@ tqdm>=4.67.1
 httpx>=0.28.1
 urllib3>=2.5.0
 chardet>=3.0.2,<6.0.0
+pymysql>=1.1.1
+PySocks>=1.7.1
