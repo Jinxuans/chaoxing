@@ -220,7 +220,11 @@ class Tiku:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
             return answer.strip()
         else:
-            answer = self._query(q_info)
+            try:
+                answer = self._query(q_info)
+            except Exception as exc:
+                logger.error(f"从{self.name}获取答案异常：{q_info['title']} -> {type(exc).__name__}: {exc}")
+                return None
             if answer:
                 answer = answer.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
@@ -1024,19 +1028,35 @@ class AI(Tiku):
                 'https': self.http_proxy
             }
 
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            proxies=proxies,
-            timeout=60
-        )
-        self.last_request_time = time.time()
-        if response.status_code != 200:
-            raise RuntimeError(f'HTTP {response.status_code}: {response.text[:500]}')
+        last_error = None
+        for attempt in range(1, self.retry_times + 1):
+            try:
+                with requests.Session() as session:
+                    session.trust_env = self.trust_env_proxy
+                    response = session.post(
+                        api_url,
+                        headers=headers,
+                        json=payload,
+                        proxies=proxies,
+                        timeout=self.timeout_seconds
+                    )
+                self.last_request_time = time.time()
+                if response.status_code != 200:
+                    raise RuntimeError(f'HTTP {response.status_code}: {response.text[:500]}')
 
-        result = response.json()
-        return result['choices'][0]['message'].get('content') or ''
+                result = response.json()
+                return result['choices'][0]['message'].get('content') or ''
+            except Exception as exc:
+                last_error = exc
+                self.last_request_time = time.time()
+                if attempt < self.retry_times:
+                    logger.warning(
+                        f'{self.name}请求失败 ({attempt}/{self.retry_times}): {type(exc).__name__}: {exc}，准备重试'
+                    )
+                    time.sleep(min(2 * attempt, 8))
+
+        logger.error(f'{self.name}请求失败，已跳过本题: {type(last_error).__name__}: {last_error}')
+        return ''
 
     def _query(self, q_info: dict):
         def remove_md_json_wrapper(md_str):
@@ -1131,6 +1151,9 @@ class AI(Tiku):
         self.model = self._conf['model']
         self.http_proxy = self._conf['http_proxy']
         self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+        self.timeout_seconds = int(self._conf.get('ai_timeout_seconds', 20))
+        self.retry_times = max(1, int(self._conf.get('ai_retry_times', 2)))
+        self.trust_env_proxy = self._conf.get('ai_trust_env_proxy', 'false').lower() == 'true'
 
     def check_llm_connection(self) -> bool:
         """

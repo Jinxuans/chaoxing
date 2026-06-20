@@ -9,6 +9,13 @@ class LoginError(Exception):
         super().__init__(*args)
 
 
+class ManualVerificationRequired(Exception):
+    def __init__(self, message: str, *, reason: str = "", evidence: str = ""):
+        super().__init__(message)
+        self.reason = reason or message
+        self.evidence = evidence
+
+
 class InputFormatError(Exception):
     def __init__(self, *args: object):
         super().__init__(*args)

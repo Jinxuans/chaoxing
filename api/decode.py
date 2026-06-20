@@ -332,16 +332,19 @@ def _process_read_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _process_video_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """处理视频类型任务"""
     try:
+        prop = card.get("property", {})
         return {
             "type": "video",
             "jobid": card.get("jobid", ""),
-            "name": card.get("property", {}).get("name", ""),
+            "name": prop.get("name", ""),
             "otherinfo": card.get("otherInfo", ""),
             "mid": card["mid"],  # 必须字段，如果不存在会抛出异常
             "objectid": card.get("objectId", ""),
             "aid": card.get("aid", ""),
             "playTime": card.get("playTime", 0),
-            "rt": card.get("property", {}).get("rt", ""),
+            "rt": prop.get("rt", ""),
+            "module": prop.get("module", ""),
+            "file_type": prop.get("type", ""),
             "attDuration": card.get("attDuration", ""),
             "attDurationEnc": card.get("attDurationEnc", ""),
             "videoFaceCaptureEnc": card.get("videoFaceCaptureEnc", ""),

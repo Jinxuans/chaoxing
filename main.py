@@ -8,15 +8,16 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from queue import PriorityQueue, ShutDown
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from tqdm import tqdm
 
 from api.answer import Tiku
 from api.base import Chaoxing, Account, StudyResult
-from api.exceptions import LoginError, InputFormatError
+from api.exceptions import LoginError, InputFormatError, ManualVerificationRequired
 from api.logger import logger
 from api.notification import Notification
 from api.live import Live
@@ -47,6 +48,29 @@ def str_to_bool(value):
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def is_audio_job(job: dict) -> bool:
+    module = str(job.get("module") or "").lower()
+    file_type = str(job.get("file_type") or "").lower()
+    name = str(job.get("name") or "").lower()
+    audio_exts = (".mp3", ".m4a", ".wav", ".aac", ".wma", ".flac", ".ogg")
+    return (
+        module in {"insertaudio", "audio"}
+        or file_type in audio_exts
+        or name.endswith(audio_exts)
+    )
+
+
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def compact_text(value: Any, limit: int = 48) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)] + "…"
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -54,7 +78,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--use-cookies", action="store_true", help="使用cookies登录")
+    parser.add_argument("--use-cookies", action="store_true", help="使用账号级cookies登录，必须同时传-u/--username")
 
     parser.add_argument(
         "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
@@ -169,6 +193,9 @@ def init_chaoxing(common_config, tiku_config):
     username = common_config.get("username", "")
     password = common_config.get("password", "")
     use_cookies = common_config.get("use_cookies", False)
+
+    if use_cookies and not username:
+        raise RuntimeError("使用 --use-cookies 或 use_cookies=true 时必须提供账号 username/-u")
     
     # 如果没有提供用户名密码，从命令行获取
     if (not username or not password) and not use_cookies:
@@ -208,19 +235,42 @@ def init_chaoxing(common_config, tiku_config):
     
     return chaoxing
 
-def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float) -> StudyResult:
+def process_job(
+    chaoxing: Chaoxing,
+    course: dict,
+    job: dict,
+    job_info: dict,
+    speed: float,
+    progress_callback: Callable[[str], None] | None = None,
+) -> StudyResult:
     """处理单个任务点"""
+    chaoxing.bind_cookie_account()
     # 视频任务
     if job["type"] == "video":
-        logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
-        # 超星的接口没有返回当前任务是否为Audio音频任务
+        media_type = "Audio" if is_audio_job(job) else "Video"
+        logger.trace(
+            f"识别到{media_type}任务, 任务章节: {course['title']} 任务ID: {job['jobid']} 文件: {job.get('name', '')}"
+        )
+        if progress_callback:
+            action = "正在收听" if media_type == "Audio" else "正在观看"
+            progress_callback(f"{action}:{compact_text(job.get('name'), 42)}")
         video_result = chaoxing.study_video(
-            course, job, job_info, _speed=speed, _type="Video"
+            course, job, job_info, _speed=speed, _type=media_type, progress_callback=progress_callback
         )
         if video_result.is_failure():
+            if video_result == StudyResult.FORBIDDEN:
+                logger.warning(
+                    f"{media_type}进度上报403 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 不再尝试其他媒体类型"
+                )
+                return video_result
+            if media_type == "Audio":
+                logger.warning(
+                    f"音频任务处理失败 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 不再按视频重试"
+                )
+                return video_result
             logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
             video_result = chaoxing.study_video(
-                course, job, job_info, _speed=speed, _type="Audio")
+                course, job, job_info, _speed=speed, _type="Audio", progress_callback=progress_callback)
         if video_result.is_failure():
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
@@ -229,18 +279,30 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
     # 文档任务
     elif job["type"] == "document":
         logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        if progress_callback:
+            progress_callback(f"正在阅读:{compact_text(job.get('name') or job.get('objectid'), 42)}")
         return chaoxing.study_document(course, job)
     # 测验任务
     elif job["type"] == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
-        return chaoxing.study_work(course, job, job_info)
+        if progress_callback:
+            progress_callback(f"正在章测:{compact_text(job.get('title') or job.get('jobid'), 42)}")
+        try:
+            return chaoxing.study_work(course, job, job_info)
+        except Exception as exc:
+            logger.error(f"章节检测任务异常，已交给章节重试: {type(exc).__name__}: {exc}")
+            return StudyResult.ERROR
     # 阅读任务
     elif job["type"] == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+        if progress_callback:
+            progress_callback(f"正在阅读:{compact_text(job.get('name') or job.get('id'), 42)}")
         return chaoxing.study_read(course, job, job_info)
     # 直播任务
     elif job["type"] == "live":
         logger.trace(f"识别到直播任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        if progress_callback:
+            progress_callback(f"正在直播:{compact_text(job.get('name') or job.get('jobid'), 42)}")
         try:
             # 准备直播所需参数
             defaults = {
@@ -281,7 +343,14 @@ class ChapterTask:
     tries: int = 0
 
 class JobProcessor:
-    def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
+    def __init__(
+        self,
+        chaoxing: Chaoxing,
+        course: dict[str, Any],
+        tasks: list[ChapterTask],
+        config: dict[str, Any],
+        progress_callback: Callable[[str, str], None] | None = None,
+    ):
         if "jobs" not in config or not config["jobs"]:
             config["jobs"] = 4
         
@@ -297,6 +366,39 @@ class JobProcessor:
         self.threads: list[threading.Thread] = []
         self.worker_num = config["jobs"]
         self.config = config
+        self.progress_callback = progress_callback
+        self.completed_tasks = 0
+        self.completed_task_indexes: set[int] = set()
+        self.progress_lock = threading.Lock()
+        self.manual_exception: ManualVerificationRequired | None = None
+
+    def build_progress_message(self, message: str, task: ChapterTask | None = None) -> str:
+        total = max(len(self.tasks), 1)
+        current = min((task.index + 1) if task else self.completed_tasks, total)
+        tries = (task.tries + 1) if task else 1
+        chapter = compact_text(task.point.get("title"), 38) if task else compact_text(self.course.get("title"), 38)
+        detail = compact_text(message, 68)
+        return (
+            f"进行中:{chapter} | 次数:{tries} | 当前:{current}/{total} | "
+            f"{detail} | 更新时间:{now_text()}"
+        )
+
+    def report_progress(self, message: str, task: ChapterTask | None = None) -> None:
+        if not self.progress_callback:
+            return
+        total = max(len(self.tasks), 1)
+        current = min((task.index + 1) if task else self.completed_tasks, total)
+        process = f"{current}/{total}"
+        self.progress_callback(process, self.build_progress_message(message, task))
+
+    def mark_task_done(self, task: ChapterTask, message: str) -> None:
+        with self.progress_lock:
+            if task.index in self.completed_task_indexes:
+                self.report_progress(message, task)
+                return
+            self.completed_task_indexes.add(task.index)
+            self.completed_tasks += 1
+            self.report_progress(message, task)
 
     def run(self):
         for task in self.tasks:
@@ -312,6 +414,8 @@ class JobProcessor:
         self.task_queue.join()
         time.sleep(0.5)
         self.task_queue.shutdown()
+        if self.manual_exception:
+            raise self.manual_exception
 
 
     @log_error
@@ -324,11 +428,38 @@ class JobProcessor:
                 logger.info("Queue shut down")
                 return
 
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            self.report_progress("准备处理章节", task)
+            try:
+                task.result = process_chapter(
+                    self.chaoxing,
+                    self.course,
+                    task.point,
+                    self.speed,
+                    progress_callback=lambda message, current_task=task: self.report_progress(message, current_task),
+                )
+            except ManualVerificationRequired as exc:
+                logger.warning("章节触发人工验证，停止课程: {} error={}", task.point.get("title", "未知章节"), exc)
+                logger.debug(traceback.format_exc())
+                self.manual_exception = exc
+                self.failed_tasks.append(task)
+                self.mark_task_done(task, f"需要人工验证: {task.point['title']}")
+                self.task_queue.task_done()
+                self.task_queue.shutdown(immediate=True)
+                return
+            except BaseException as exc:
+                logger.warning(
+                    "章节处理异常，交给重试队列: {} error={}: {}",
+                    task.point.get("title", "未知章节"),
+                    type(exc).__name__,
+                    exc,
+                )
+                logger.debug(traceback.format_exc())
+                task.result = ChapterResult.ERROR
 
             match task.result:
                 case ChapterResult.SUCCESS:
                     logger.debug("Task success: {}", task.point["title"])
+                    self.mark_task_done(task, f"章节完成: {task.point['title']}")
                     self.task_queue.task_done()
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
@@ -336,6 +467,7 @@ class JobProcessor:
                     # task.tries += 1
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                        self.mark_task_done(task, f"章节未开启，已跳过: {task.point['title']}")
                         self.task_queue.task_done()
                         continue
 
@@ -344,6 +476,7 @@ class JobProcessor:
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                             "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
                         , task.point["title"])
+                        self.mark_task_done(task, f"章节未开启，停止重试: {task.point['title']}")
                         self.task_queue.task_done()
                         continue
 
@@ -357,6 +490,7 @@ class JobProcessor:
                     if task.tries >= self.max_tries:
                         logger.error("Max retries reached for task: {}", task.point["title"])
                         self.failed_tasks.append(task)
+                        self.mark_task_done(task, f"章节失败: {task.point['title']}")
                         self.task_queue.task_done()
                         continue
                     self.retry_queue.put(task)
@@ -364,6 +498,7 @@ class JobProcessor:
                 case _:
                     logger.error("Invalid task state {} for task {}", task.result, task.point["title"])
                     self.failed_tasks.append(task)
+                    self.mark_task_done(task, f"章节状态异常: {task.point['title']}")
                     self.task_queue.task_done()
 
     @log_error
@@ -380,11 +515,20 @@ class JobProcessor:
             pass
 
 
-def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
+def process_chapter(
+    chaoxing: Chaoxing,
+    course: dict[str, Any],
+    point: dict[str, Any],
+    speed: float,
+    progress_callback: Callable[[str], None] | None = None,
+) -> ChapterResult:
     """处理单个章节"""
+    chaoxing.bind_cookie_account()
     logger.info(f'当前章节: {point["title"]}')
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
+        if progress_callback:
+            progress_callback("章节已完成")
         return ChapterResult.SUCCESS
     
     # 随机等待，避免请求过快
@@ -396,16 +540,24 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 
     # 发现未开放章节, 根据配置处理
     if job_info.get("notOpen", False):
+        if progress_callback:
+            progress_callback("章节未开放")
         return ChapterResult.NOT_OPEN
 
     # 已经默认处理空任务，此处不需要判断
     if not jobs:
         pass
+    elif progress_callback:
+        progress_callback(f"任务点:{len(jobs)}个")
 
-    # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
+    # 章节内任务点共享同一个超星会话，进度上报并发容易触发403；默认跟随 jobs 串行。
     job_results:list[StudyResult]=[]
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), jobs):
+    def run_job(job: dict) -> StudyResult:
+        chaoxing.bind_cookie_account()
+        return process_job(chaoxing, course, job, job_info, speed, progress_callback=progress_callback)
+
+    with ThreadPoolExecutor(max_workers=max(1, int(chaoxing.kwargs.get("jobs", 1) or 1))) as executor:
+        for result in executor.map(run_job, jobs):
             job_results.append(result)
     
     for result in job_results:
@@ -416,9 +568,16 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 
 
 
-def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
+def process_course(
+    chaoxing: Chaoxing,
+    course: dict[str, Any],
+    config: dict,
+    progress_callback: Callable[[str, str], None] | None = None,
+):
     """处理单个课程"""
     logger.info(f"开始学习课程: {course['title']}")
+    if progress_callback:
+        progress_callback("0%", f"开始课程: {course['title']}")
     
     # 获取当前课程的所有章节
     point_list = chaoxing.get_course_point(
@@ -436,8 +595,11 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     for i, point in enumerate(point_list["points"]):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
-    p = JobProcessor(chaoxing, course, tasks, config)
+    p = JobProcessor(chaoxing, course, tasks, config, progress_callback=progress_callback)
     p.run()
+
+    if progress_callback:
+        progress_callback("100%", f"课程完成: {course['title']}")
 
 
     tqdm.format_sizeof = _old_format_sizeof
